@@ -1,575 +1,395 @@
 """
-SQLite database manager for project tracking and pipeline stages
-Thread-safe with connection pooling
+Prompt templates for AI agents
+All prompts are carefully crafted for optimal results
 """
 
-import sqlite3
-import threading
-from pathlib import Path
-from typing import Dict, List, Optional, Any
-from datetime import datetime
-from contextlib import contextmanager
+# ============================================================================
+# AGENT 3: VISION DESCRIPTION PROMPTS
+# ============================================================================
 
-from config.settings import DATABASE_PATH, DATABASE_BACKUP_ENABLED
-from utils.logger import setup_logger
+VISION_ANALYSIS_SYSTEM_PROMPT = """You are an expert at analyzing screen recordings and identifying UI elements and user interactions.
 
-logger = setup_logger("database")
+Your task is to describe what is happening in screenshots from a screen recording in a structured way.
 
+Focus on:
+1. Identifying UI elements (buttons, forms, menus, text fields, etc.)
+2. Understanding what the cursor is interacting with
+3. Describing the action being performed
+4. Identifying the page/application state
 
-class Database:
-    """Thread-safe SQLite database manager"""
-    
-    _instance = None
-    _lock = threading.Lock()
-    
-    def __new__(cls):
-        """Singleton pattern to ensure one database instance"""
-        if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    cls._instance = super().__new__(cls)
-        return cls._instance
-    
-    def __init__(self):
-        """Initialize database connection"""
-        if not hasattr(self, 'initialized'):
-            self.db_path = DATABASE_PATH
-            self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            self._local = threading.local()
-            self.initialized = True
-            self._create_tables()
-            logger.info(f"Database initialized at {self.db_path}")
-    
-    @contextmanager
-    def _get_connection(self):
-        """Get thread-local database connection"""
-        if not hasattr(self._local, 'connection'):
-            self._local.connection = sqlite3.connect(
-                str(self.db_path),
-                check_same_thread=False,
-                timeout=30.0
-            )
-            self._local.connection.row_factory = sqlite3.Row
-        
-        try:
-            yield self._local.connection
-        except Exception as e:
-            self._local.connection.rollback()
-            logger.error(f"Database error: {e}", exc_info=True)
-            raise
-        else:
-            self._local.connection.commit()
-    
-    def _create_tables(self):
-        """Create database schema"""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Projects table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS projects (
-                    project_id VARCHAR(36) PRIMARY KEY,
-                    user_id VARCHAR(50) NOT NULL,
-                    video_name VARCHAR(255) NOT NULL,
-                    video_path TEXT NOT NULL,
-                    status VARCHAR(20) NOT NULL,
-                    current_stage VARCHAR(50),
-                    upload_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    processing_start TIMESTAMP,
-                    processing_end TIMESTAMP,
-                    duration_seconds FLOAT,
-                    file_size_mb FLOAT,
-                    resolution VARCHAR(20),
-                    error_message TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            
-            # Pipeline stages tracking
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS pipeline_stages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    project_id VARCHAR(36) NOT NULL,
-                    stage_name VARCHAR(50) NOT NULL,
-                    status VARCHAR(20) NOT NULL,
-                    start_time TIMESTAMP,
-                    end_time TIMESTAMP,
-                    duration_seconds FLOAT,
-                    tokens_used INTEGER DEFAULT 0,
-                    cost_usd DECIMAL(10,4) DEFAULT 0.0,
-                    error_message TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (project_id) REFERENCES projects(project_id) ON DELETE CASCADE
-                )
-            """)
-            
-            # Create indexes for better query performance
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_projects_user_id 
-                ON projects(user_id)
-            """)
-            
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_projects_status 
-                ON projects(status)
-            """)
-            
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_stages_project_id 
-                ON pipeline_stages(project_id)
-            """)
-            
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_stages_stage_name 
-                ON pipeline_stages(stage_name)
-            """)
-            
-            conn.commit()
-            logger.info("Database tables created/verified")
-    
-    # ========================================================================
-    # PROJECT OPERATIONS
-    # ========================================================================
-    
-    def create_project(self, project_data: Dict[str, Any]) -> bool:
-        """
-        Create a new project record
-        
-        Args:
-            project_data: Dictionary with project information
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                
-                cursor.execute("""
-                    INSERT INTO projects (
-                        project_id, user_id, video_name, video_path,
-                        status, current_stage, duration_seconds,
-                        file_size_mb, resolution
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    project_data['project_id'],
-                    project_data.get('user_id', 'default'),
-                    project_data['video_name'],
-                    project_data['video_path'],
-                    project_data.get('status', 'created'),
-                    project_data.get('current_stage', 'initialized'),
-                    project_data.get('duration_seconds'),
-                    project_data.get('file_size_mb'),
-                    project_data.get('resolution')
-                ))
-                
-                logger.info(f"Created project record: {project_data['project_id']}")
-                return True
-                
-        except Exception as e:
-            logger.error(f"Failed to create project: {e}", exc_info=True)
-            return False
-    
-    def get_project(self, project_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Get project by ID
-        
-        Args:
-            project_id: Project identifier
-            
-        Returns:
-            Project dictionary or None if not found
-        """
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT * FROM projects WHERE project_id = ?
-                """, (project_id,))
-                
-                row = cursor.fetchone()
-                if row:
-                    return dict(row)
-                return None
-                
-        except Exception as e:
-            logger.error(f"Failed to get project: {e}", exc_info=True)
-            return None
-    
-    def update_project_status(self, project_id: str, status: str, 
-                             current_stage: Optional[str] = None) -> bool:
-        """
-        Update project status and current stage
-        
-        Args:
-            project_id: Project identifier
-            status: New status (processing, complete, error, etc.)
-            current_stage: Optional current stage name
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                
-                if current_stage:
-                    cursor.execute("""
-                        UPDATE projects 
-                        SET status = ?, 
-                            current_stage = ?,
-                            updated_at = CURRENT_TIMESTAMP
-                        WHERE project_id = ?
-                    """, (status, current_stage, project_id))
-                else:
-                    cursor.execute("""
-                        UPDATE projects 
-                        SET status = ?,
-                            updated_at = CURRENT_TIMESTAMP
-                        WHERE project_id = ?
-                    """, (status, project_id))
-                
-                # Set processing timestamps
-                if status == "processing":
-                    cursor.execute("""
-                        UPDATE projects 
-                        SET processing_start = CURRENT_TIMESTAMP
-                        WHERE project_id = ? AND processing_start IS NULL
-                    """, (project_id,))
-                elif status in ["complete", "error", "failed"]:
-                    cursor.execute("""
-                        UPDATE projects 
-                        SET processing_end = CURRENT_TIMESTAMP
-                        WHERE project_id = ?
-                    """, (project_id,))
-                
-                return True
-                
-        except Exception as e:
-            logger.error(f"Failed to update project status: {e}", exc_info=True)
-            return False
-    
-    def list_projects(self, user_id: Optional[str] = None, 
-                     status: Optional[str] = None,
-                     limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
-        """
-        List projects with optional filters
-        
-        Args:
-            user_id: Filter by user ID
-            status: Filter by status
-            limit: Maximum number of results
-            offset: Offset for pagination
-            
-        Returns:
-            List of project dictionaries
-        """
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                
-                query = "SELECT * FROM projects WHERE 1=1"
-                params = []
-                
-                if user_id:
-                    query += " AND user_id = ?"
-                    params.append(user_id)
-                
-                if status:
-                    query += " AND status = ?"
-                    params.append(status)
-                
-                query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
-                params.extend([limit, offset])
-                
-                cursor.execute(query, params)
-                
-                return [dict(row) for row in cursor.fetchall()]
-                
-        except Exception as e:
-            logger.error(f"Failed to list projects: {e}", exc_info=True)
-            return []
-    
-    def delete_project(self, project_id: str) -> bool:
-        """
-        Delete project and all related records
-        
-        Args:
-            project_id: Project identifier
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                
-                # Delete stages (cascade should handle this, but being explicit)
-                cursor.execute("""
-                    DELETE FROM pipeline_stages WHERE project_id = ?
-                """, (project_id,))
-                
-                # Delete project
-                cursor.execute("""
-                    DELETE FROM projects WHERE project_id = ?
-                """, (project_id,))
-                
-                logger.info(f"Deleted project from database: {project_id}")
-                return True
-                
-        except Exception as e:
-            logger.error(f"Failed to delete project: {e}", exc_info=True)
-            return False
-    
-    # ========================================================================
-    # PIPELINE STAGE OPERATIONS
-    # ========================================================================
-    
-    def log_stage(self, project_id: str, stage_name: str, status: str,
-                  start_time: Optional[datetime] = None,
-                  end_time: Optional[datetime] = None,
-                  tokens_used: int = 0,
-                  cost_usd: float = 0.0,
-                  error_message: Optional[str] = None) -> bool:
-        """
-        Log a pipeline stage execution
-        
-        Args:
-            project_id: Project identifier
-            stage_name: Name of the stage
-            status: Stage status (started, completed, failed)
-            start_time: Stage start time
-            end_time: Stage end time
-            tokens_used: Number of tokens consumed
-            cost_usd: Cost in USD
-            error_message: Error message if failed
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                
-                # Calculate duration if both times provided
-                duration_seconds = None
-                if start_time and end_time:
-                    duration_seconds = (end_time - start_time).total_seconds()
-                
-                cursor.execute("""
-                    INSERT INTO pipeline_stages (
-                        project_id, stage_name, status, start_time, end_time,
-                        duration_seconds, tokens_used, cost_usd, error_message
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    project_id, stage_name, status,
-                    start_time, end_time, duration_seconds,
-                    tokens_used, cost_usd, error_message
-                ))
-                
-                return True
-                
-        except Exception as e:
-            logger.error(f"Failed to log stage: {e}", exc_info=True)
-            return False
-    
-    def get_project_stages(self, project_id: str) -> List[Dict[str, Any]]:
-        """
-        Get all stages for a project
-        
-        Args:
-            project_id: Project identifier
-            
-        Returns:
-            List of stage dictionaries
-        """
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT * FROM pipeline_stages 
-                    WHERE project_id = ?
-                    ORDER BY created_at ASC
-                """, (project_id,))
-                
-                return [dict(row) for row in cursor.fetchall()]
-                
-        except Exception as e:
-            logger.error(f"Failed to get project stages: {e}", exc_info=True)
-            return []
-    
-    def get_project_cost_summary(self, project_id: str) -> Dict[str, Any]:
-        """
-        Get cost summary for a project
-        
-        Args:
-            project_id: Project identifier
-            
-        Returns:
-            Cost summary dictionary
-        """
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT 
-                        SUM(tokens_used) as total_tokens,
-                        SUM(cost_usd) as total_cost_usd,
-                        stage_name,
-                        SUM(cost_usd) as stage_cost
-                    FROM pipeline_stages
-                    WHERE project_id = ?
-                    GROUP BY stage_name
-                """, (project_id,))
-                
-                stages = cursor.fetchall()
-                
-                # Get totals
-                cursor.execute("""
-                    SELECT 
-                        SUM(tokens_used) as total_tokens,
-                        SUM(cost_usd) as total_cost_usd
-                    FROM pipeline_stages
-                    WHERE project_id = ?
-                """, (project_id,))
-                
-                totals = cursor.fetchone()
-                
-                return {
-                    "total_tokens": totals['total_tokens'] or 0,
-                    "total_cost_usd": float(totals['total_cost_usd'] or 0.0),
-                    "breakdown": {
-                        stage['stage_name']: float(stage['stage_cost'] or 0.0)
-                        for stage in stages
-                    }
-                }
-                
-        except Exception as e:
-            logger.error(f"Failed to get cost summary: {e}", exc_info=True)
-            return {
-                "total_tokens": 0,
-                "total_cost_usd": 0.0,
-                "breakdown": {}
-            }
-    
-    # ========================================================================
-    # UTILITY OPERATIONS
-    # ========================================================================
-    
-    def backup_database(self, backup_path: Optional[Path] = None) -> bool:
-        """
-        Create a backup of the database
-        
-        Args:
-            backup_path: Optional custom backup path
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        if not DATABASE_BACKUP_ENABLED:
-            return True
-        
-        try:
-            if not backup_path:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                backup_path = self.db_path.parent / f"projects_backup_{timestamp}.db"
-            
-            with self._get_connection() as conn:
-                # Create backup connection
-                backup_conn = sqlite3.connect(str(backup_path))
-                conn.backup(backup_conn)
-                backup_conn.close()
-            
-            logger.info(f"Database backed up to {backup_path}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to backup database: {e}", exc_info=True)
-            return False
-    
-    def cleanup_old_records(self, days: int = 90) -> int:
-        """
-        Delete records older than specified days
-        
-        Args:
-            days: Number of days to retain
-            
-        Returns:
-            Number of records deleted
-        """
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                
-                # Delete old projects
-                cursor.execute("""
-                    DELETE FROM projects 
-                    WHERE created_at < datetime('now', '-' || ? || ' days')
-                """, (days,))
-                
-                deleted = cursor.rowcount
-                logger.info(f"Cleaned up {deleted} old database records")
-                return deleted
-                
-        except Exception as e:
-            logger.error(f"Failed to cleanup old records: {e}", exc_info=True)
-            return 0
-    
-    def get_statistics(self) -> Dict[str, Any]:
-        """
-        Get database statistics
-        
-        Returns:
-            Statistics dictionary
-        """
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                
-                # Total projects
-                cursor.execute("SELECT COUNT(*) as count FROM projects")
-                total_projects = cursor.fetchone()['count']
-                
-                # Projects by status
-                cursor.execute("""
-                    SELECT status, COUNT(*) as count 
-                    FROM projects 
-                    GROUP BY status
-                """)
-                by_status = {row['status']: row['count'] for row in cursor.fetchall()}
-                
-                # Total cost
-                cursor.execute("""
-                    SELECT SUM(cost_usd) as total_cost
-                    FROM pipeline_stages
-                """)
-                total_cost = cursor.fetchone()['total_cost'] or 0.0
-                
-                # Database size
-                db_size_mb = self.db_path.stat().st_size / (1024 * 1024)
-                
-                return {
-                    "total_projects": total_projects,
-                    "projects_by_status": by_status,
-                    "total_cost_usd": float(total_cost),
-                    "database_size_mb": round(db_size_mb, 2)
-                }
-                
-        except Exception as e:
-            logger.error(f"Failed to get statistics: {e}", exc_info=True)
-            return {}
-    
-    def close(self):
-        """Close database connections"""
-        if hasattr(self._local, 'connection'):
-            self._local.connection.close()
-            delattr(self._local, 'connection')
+Be concise and precise. Return your analysis as valid JSON."""
 
 
-# Create global database instance
-_db_instance = Database()
+def format_vision_prompt(cursor_position=None):
+    """
+    Format prompt for GPT-4o Vision analysis
+    
+    Args:
+        cursor_position: [x, y] coordinates if cursor detected
+        
+    Returns:
+        Formatted prompt string
+    """
+    cursor_info = ""
+    if cursor_position:
+        cursor_info = f"\nThe cursor is located at position: {cursor_position}"
+    
+    return f"""Analyze this screenshot from a screen recording and describe what is happening.{cursor_info}
 
-def get_db() -> Database:
-    """Get global database instance"""
-    return _db_instance
+Return a JSON object with this exact structure:
+
+{{
+  "ui_elements": [
+    {{
+      "type": "button|input|dropdown|menu|text|image|link|form",
+      "text": "visible text or label",
+      "bbox": [x1, y1, x2, y2],
+      "state": "enabled|disabled|focused|highlighted"
+    }}
+  ],
+  "cursor_on": "name of the element the cursor is pointing at (or null)",
+  "action": "hovering|clicking|typing|scrolling|selecting|dragging",
+  "page_state": "brief description of the current page/screen (e.g., 'login_page', 'dashboard', 'settings')",
+  "context": "brief 1-2 sentence description of what the user is doing"
+}}
+
+Important:
+- Only include UI elements that are clearly visible and relevant
+- bbox coordinates should be approximate [left, top, right, bottom]
+- Keep descriptions concise and factual
+- If cursor position is provided, identify what it's pointing at"""
+
+
+# ============================================================================
+# AGENT 5: ANALYSIS AGENT PROMPTS
+# ============================================================================
+
+ANALYSIS_SYSTEM_PROMPT = """You are an expert video editor analyzing screen recordings to create professional tutorials.
+
+Your task is to merge data from multiple sources (cursor tracking, visual analysis, audio transcription) into a unified timeline of important events with editing suggestions.
+
+For each event, you must suggest appropriate edit actions:
+- ZOOM: Focus viewer attention on clicks, important UI elements
+- CUT: Remove unnecessary pauses, loading screens, mistakes
+- HIGHLIGHT: Add visual emphasis to key moments
+- MAINTAIN: Keep important content as-is
+- SPEED: Speed up repetitive or boring parts
+
+Return your analysis as structured JSON."""
+
+
+def format_analysis_prompt(cursor_events, frame_descriptions, transcript, silence_segments, video_metadata):
+    """
+    Format prompt for timeline analysis
+    
+    Args:
+        cursor_events: JSON string of cursor tracking data
+        frame_descriptions: JSON string of vision analysis
+        transcript: JSON string of audio transcript
+        silence_segments: JSON string of silence periods
+        video_metadata: JSON string of video info
+        
+    Returns:
+        Formatted prompt string
+    """
+    return f"""You are analyzing a screen recording to create a professional edited video.
+
+## INPUT DATA
+
+### Video Metadata
+{video_metadata}
+
+### Cursor Events (clicks, hovers, movements)
+{cursor_events}
+
+### Visual Frame Descriptions
+{frame_descriptions}
+
+### Audio Transcript
+{transcript}
+
+### Silence Segments
+{silence_segments}
+
+## YOUR TASK
+
+Create a chronological timeline of important events with editing suggestions.
+
+For each event, determine:
+1. **Timestamp**: When it occurs
+2. **Type**: click, hover, page_load, speech, silence, typing, navigation
+3. **Element**: Which UI element is involved (if applicable)
+4. **Importance**: high (crucial step), medium (helpful), low (can be cut/sped up)
+5. **Suggested Edit**: What editing action would improve the video
+
+## EDITING GUIDELINES
+
+**High Importance Events (keep and enhance):**
+- User clicks on buttons/links → ZOOM in on the element
+- Page transitions → MAINTAIN with smooth transition
+- Speech explaining concepts → MAINTAIN audio
+- Important form fills → ZOOM on input fields
+
+**Medium Importance Events (keep but may optimize):**
+- Cursor hovering → Slight highlight
+- Reading text → MAINTAIN
+- Minor navigation → MAINTAIN
+
+**Low Importance Events (cut or speed up):**
+- Long silences (>2s) during loading → CUT most of it
+- Loading screens → CUT or speed up 2-4x
+- Repetitive actions → SPEED up 1.5-2x
+- Mistakes/corrections → CUT entirely
+- Dead air with no action → CUT
+
+## OUTPUT FORMAT
+
+Return a JSON object:
+
+{{
+  "event_timeline": [
+    {{
+      "id": 1,
+      "timestamp": 0.0,
+      "end_timestamp": 3.5,
+      "type": "speech|click|hover|page_load|silence|typing",
+      "element": "name of UI element or null",
+      "description": "brief description of what's happening",
+      "importance": "high|medium|low",
+      "suggested_edit": {{
+        "action": "zoom|highlight|cut|maintain|speed",
+        "params": {{
+          // For zoom: {{"target_bbox": [x1,y1,x2,y2], "zoom_scale": 1.5, "duration": 1.0}}
+          // For cut: {{"reason": "loading screen", "keep_duration": 0.5}}
+          // For speed: {{"speed_multiplier": 2.0}}
+          // For highlight: {{"bbox": [x1,y1,x2,y2], "effect": "glow", "color": "blue"}}
+        }}
+      }}
+    }}
+  ]
+}}
+
+Be thorough but practical. Aim to reduce video length by 20-40% while keeping all important content.
+Prioritize user actions (clicks, typing) over passive moments (reading, waiting)."""
+
+
+# ============================================================================
+# AGENT 6: SCRIPT PLANNER PROMPTS
+# ============================================================================
+
+SCRIPT_PLANNER_SYSTEM_PROMPT = """You are an expert scriptwriter and video editor creating professional tutorial videos.
+
+Your task is to:
+1. Write a clear, engaging narration script that explains the screen recording
+2. Create a detailed edit plan with precise timestamps
+
+The narration should:
+- Use natural, conversational language
+- Explain what the user is doing and why
+- Anticipate viewer questions
+- Be concise and well-paced
+
+The edit plan should:
+- Specify exact timestamps for all edits
+- Include cuts, zooms, highlights, and speed changes
+- Create a polished final product
+
+Return both as structured JSON."""
+
+
+def format_script_planner_prompt(event_timeline, original_transcript, video_metadata, user_preferences):
+    """
+    Format prompt for script and edit planning
+    
+    Args:
+        event_timeline: JSON string of analyzed events
+        original_transcript: JSON string of original audio
+        video_metadata: JSON string of video info
+        user_preferences: JSON string of user preferences
+        
+    Returns:
+        Formatted prompt string
+    """
+    return f"""You are creating a polished, professional tutorial video from a screen recording.
+
+## INPUT DATA
+
+### Video Metadata
+{video_metadata}
+
+### Event Timeline (analyzed user actions)
+{event_timeline}
+
+### Original Audio Transcript
+{original_transcript}
+
+### User Preferences
+{user_preferences}
+
+## YOUR TASKS
+
+### 1. NARRATION SCRIPT
+
+Write a clear, engaging narration script that:
+- Explains each step of the process
+- Flows naturally and conversationally
+- Matches the user's preferred style (professional/casual/technical)
+- Syncs with the visual actions
+- Uses appropriate pauses [PAUSE 0.5s] where needed
+
+**Style Guidelines:**
+- **Professional**: Clear, authoritative, no slang. "First, we'll navigate to the settings page."
+- **Casual**: Friendly, conversational. "Alright, let's head over to settings real quick."
+- **Technical**: Precise, detailed. "Navigate to Settings > Advanced > Configuration to access the API credentials."
+
+### 2. DETAILED EDIT PLAN
+
+Create precise editing instructions:
+
+**Available Edit Actions:**
+
+1. **CUT** - Remove unwanted segments
+   ```
+   {{"action": "cut", "start": 10.0, "end": 14.0, "params": {{"reason": "loading screen"}}}}
+   ```
+
+2. **ZOOM** - Focus on specific UI elements
+   ```
+   {{"action": "zoom", "start": 5.0, "params": {{
+     "target_bbox": [450, 320, 550, 380],
+     "zoom_scale": 1.5,
+     "animation": "smooth",
+     "duration": 1.5
+   }}}}
+   ```
+
+3. **HIGHLIGHT** - Add visual emphasis
+   ```
+   {{"action": "highlight", "start": 8.0, "params": {{
+     "bbox": [450, 320, 550, 380],
+     "effect": "glow",
+     "color": "blue",
+     "intensity": 0.7
+   }}}}
+   ```
+
+4. **SPEED** - Change playback speed
+   ```
+   {{"action": "speed", "start": 15.0, "end": 20.0, "params": {{
+     "speed_multiplier": 2.0,
+     "reason": "repetitive action"
+   }}}}
+   ```
+
+5. **CLICK_EFFECT** - Add click animation
+   ```
+   {{"action": "click_effect", "start": 4.0, "params": {{
+     "position": [475, 350],
+     "effect_type": "ripple",
+     "duration": 0.8
+   }}}}
+   ```
+
+## OUTPUT FORMAT
+
+Return a JSON object with TWO sections:
+
+{{
+  "narration_script": {{
+    "style": "professional|casual|technical",
+    "total_duration": 65.0,
+    "segments": [
+      {{
+        "id": 1,
+        "start": 0.0,
+        "end": 3.5,
+        "text": "First, we'll navigate to the checkout page...",
+        "timing_notes": "matches page transition at 0.5s"
+      }}
+    ],
+    "full_script_text": "Complete script text with timing markers [PAUSE 0.5s] where needed"
+  }},
+  
+  "edit_plan": {{
+    "timeline": [
+      {{
+        "id": 1,
+        "action": "cut|zoom|highlight|speed|click_effect",
+        "start": 0.0,
+        "end": 5.0,  // optional, for cuts and speed changes
+        "params": {{
+          // action-specific parameters
+        }}
+      }}
+    ],
+    "summary": {{
+      "total_cuts": 8,
+      "total_zooms": 12,
+      "total_highlights": 5,
+      "total_effects": 15,
+      "original_duration": 100.0,
+      "final_duration": 65.0,
+      "time_saved": 35.0
+    }}
+  }}
+}}
+
+## IMPORTANT RULES
+
+1. Narration must be complete and ready for TTS (no placeholders)
+2. All timestamps must be precise and within video duration
+3. Edit actions should not overlap in destructive ways
+4. Prioritize clarity and viewer comprehension over fancy effects
+5. Make the video 20-40% shorter while keeping all important content
+6. Ensure smooth flow between segments"""
+
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def format_error_recovery_prompt(agent_name, error_message, input_data):
+    """
+    Format prompt for error recovery attempts
+    
+    Args:
+        agent_name: Name of the agent that failed
+        error_message: Error message
+        input_data: Original input data
+        
+    Returns:
+        Formatted prompt for retry
+    """
+    return f"""The previous attempt by {agent_name} failed with error: {error_message}
+
+Please retry the task with the following input data, being more careful with:
+- JSON formatting (ensure valid JSON)
+- Data validation (check for null/missing values)
+- Edge cases (empty arrays, zero durations)
+
+Input Data:
+{input_data}
+
+Provide a robust response that handles edge cases gracefully."""
+
+
+# ============================================================================
+# EXPORT ALL PROMPTS
+# ============================================================================
+
+__all__ = [
+    # Vision Prompts
+    'VISION_ANALYSIS_SYSTEM_PROMPT',
+    'format_vision_prompt',
+    
+    # Analysis Prompts
+    'ANALYSIS_SYSTEM_PROMPT',
+    'format_analysis_prompt',
+    
+    # Script Planner Prompts
+    'SCRIPT_PLANNER_SYSTEM_PROMPT',
+    'format_script_planner_prompt',
+    
+    # Utility
+    'format_error_recovery_prompt'
+]
